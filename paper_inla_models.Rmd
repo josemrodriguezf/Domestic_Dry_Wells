@@ -40,7 +40,6 @@ library(ggside)
 shp_gwb <- st_read('./Study_Area/sa_basins.shp') 
 # convert to sf object
 gwb_p <- st_as_sf(shp_gwb,
-       remove = F, 
        crs = 4326) 
 # define projection
 gwb_p <- gwb_p %>% st_transform(crs = 3578) # meters better than long lat for R-INLA
