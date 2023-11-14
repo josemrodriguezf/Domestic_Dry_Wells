@@ -6,6 +6,8 @@
 ```{r}
 library(tidyverse)       
 library(patchwork)        
+library(ggtext)           
+library(scales)          
 library(modelr)           
 library(distributional)   
 library(kableExtra)       
