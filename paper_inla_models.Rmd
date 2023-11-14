@@ -112,8 +112,7 @@ cor <- data_model_3mi |>
                 ag_wells_density,
                 dom_wells_density,
                 Poverty,
-                Surface_Water,
-                dry_condition)
+                Surface_Water)
 ```
 #
 ```{r}
