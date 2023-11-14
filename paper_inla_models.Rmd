@@ -1,0 +1,1113 @@
+# R-INLA modeling dry wells
+# Author: José M. Rodríguez-Flores
+# Last version: 06/05/2023
+# Repo: 
+
+```{r}
+library(tidyverse)       
+library(patchwork)        
+library(ggtext)           
+library(scales)          
+library(modelr)           
+library(distributional)   
+library(kableExtra)       
+library(INLA)
+library(INLAutils)
+library(brinla)
+library(usdm)
+library(lares)
+library(PresenceAbsence)
+library(pROC)
+library(geosphere)
+library(ggdist)
+library(PresenceAbsence)
+library(psych)
+library(sf)
+library(blockCV)
+library(spatialRF)
+library(vtable)
+library(gstat)
+library(lme4)
+library(reshape2)
+library(ggcorrplot)
+library(ggnewscale)
+library(ggside)
+```
+
+
+```{r}
+# Basins Study Area
+shp_gwb <- st_read('./Study_Area/sa_basins.shp') 
+# convert to sf object
+gwb_p <- st_as_sf(shp_gwb,
+       remove = F, 
+       crs = 4326) 
+# define projection
+gwb_p <- gwb_p %>% st_transform(crs = 3578) # meters better than long lat for R-INLA
+```
+
+```{r}
+data_model_5mi <- readRDS("./Data_model/wells_data_5mi.rds")
+data_model_3mi <- readRDS("./Data_model/wells_data_3mi.rds")
+```
+
+# Transform coords to UTM - meters
+
+```{r}
+data_model_3mi <- st_as_sf(data_model_3mi,
+       remove = FALSE, 
+       coords=c('lon','lat'),
+       crs = 4326) |> st_transform(crs = 3578)
+data_model_5mi <- st_as_sf(data_model_5mi,
+       remove = FALSE, 
+       coords=c('lon','lat'),
+       crs = 4326) |> st_transform(crs = 3578)
+
+data_model_3mi <- data_model_3mi |> mutate(x = sf::st_coordinates(geometry)[,1],
+                                           y = sf::st_coordinates(geometry)[,2])
+data_model_5mi <- data_model_5mi |> mutate(x = sf::st_coordinates(geometry)[,1],
+                                           y = sf::st_coordinates(geometry)[,2])
+
+data_model_3mi <- as_tibble(data_model_3mi) |> dplyr::select(-geometry)
+data_model_5mi <- as_tibble(data_model_5mi) |> dplyr::select(-geometry)
+```
+
+
+# # Spatial autocorrelation
+# Moran's autocorr plot
+
+```{r}
+predictors <- c("r_area_perennial","r_area_forage","r_area_annual","r_well_depth_gw_level","dom_wells_density","ag_wells_density","Poverty","Surface_Water")
+
+Loc <- data_model_3mi[, c("lon", "lat")] #Spatial locations
+Distances <- distm(Loc)/1000 # Km
+Loc["x"] <- Loc$lon
+Loc["y"] <- Loc$lat
+
+#distance thresholds (same units as distance_matrix)
+distance.thresholds <- c(5, 20, 35, 50, 100)
+
+spatialRF::plot_training_df_moran(
+  data = data_model_3mi,
+  dependent.variable.name = "dry_condition",
+  predictor.variable.names = predictors,
+  distance.matrix = Distances,
+  distance.thresholds = distance.thresholds,
+  fill.color = viridis::viridis(
+    100,
+    option = "C",
+    direction = -1),
+  point.color = "black") +
+  labs(x = "Distance threshold (km)")
+```
+#
+# Correlations
+#
+```{r}
+cor <- data_model_3mi |>
+  dplyr::select(r_area_perennial,
+                r_area_annual,
+                r_area_forage,
+                r_well_depth_gw_level,
+                ag_wells_density,
+                dom_wells_density,
+                Poverty,
+                Surface_Water,
+                dry_condition)
+```
+#
+```{r}
+# Function to get asteriks
+labs.function = function(x){
+  case_when(x >= 0.05 ~ "",
+            x < 0.05 & x >= 0.01 ~ "*",
+            x < 0.01 & x >= 0.001 ~ "**",
+            x < 0.001 ~ "***")
+}
+
+
+cor$Surface_Water[is.na(cor$Surface_Water)] = 0
+cor_m <- round(cor(cor),1)
+p.mat <- cor_pmat(cor)
+p.labs = as.data.frame(p.mat)  %>%
+  mutate_all(labs.function)
+
+p.labs$Var1 = as.factor(rownames(p.labs))
+p.labs = melt(p.labs, id.vars = "Var1", variable.name = "Var2", value.name = "lab")
+
+
+cor.plot <- ggcorrplot(cor_m,hc.order=TRUE,type="lower",colors = c("darkblue", "white", "red"),lab = TRUE) +  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x="",y="")
+
+p.labs$in.df = ifelse(is.na(match(paste0(p.labs$Var1, p.labs$Var2),
+                                  paste0(cor.plot[["data"]]$Var1, cor.plot[["data"]]$Var2))),
+                      "No", "Yes")
+
+p.labs = dplyr::select(p.labs |> filter(in.df == "Yes"), -in.df)
+
+# Add asteriks to ggcorrplot
+cor.plot.labs = cor.plot +
+  geom_text(aes(x = p.labs$Var1,
+                y = p.labs$Var2),
+            label = p.labs$lab,
+            nudge_y = 0.25,
+            size = 5) +
+  theme(panel.grid.major = element_blank())
+
+cor.plot.labs
+```
+
+
+```{r}
+# Variance Inflation Factor (VIF) values
+vif(as.data.frame(cor))
+```
+
+# Distances among wells
+
+```{r}
+Loc2 <- data_model_3mi[, c("x", "y")] #Spatial locations
+Distances <- dist(Loc2)*0.000621371 #meters * miles
+hist(Distances,xlab="Distances (mi)")
+summary(c(Distances))
+```
+
+# Functions
+
+## Function for data splitting training and validation (cross-validation)
+
+```{r}
+split_data <- function(data){
+# Split Training and validation per data frame
+pa_data <- sf::st_as_sf(data |> dplyr::select(lon,lat,dry_condition), coords = c("lon", "lat"), crs = 4326)
+sb1 <- cv_spatial(x = pa_data,
+                  column = "dry_condition", # the response column (binary 1/0)
+                  k = 4, # number of folds
+                  size = 1600, # size of the blocks in meters (1 mi)
+                  selection = "random", # random blocks-to-fold
+                  iteration = 50,
+                  seed = 30) # find evenly dispersed folds
+
+folds <- sb1$folds_list
+training_data <- data[as.vector(folds[[1]][[1]]),]
+testing_data <- data[as.vector(folds[[1]][[2]]),]
+return(list(training_data,testing_data))}
+```
+
+## Functions that we'll be using for summaries and visualizations
+
+```{r}
+random_fix_effects <- function(r){
+
+fix_eff = tibble(names = names(r$marginals.fixed), m.fixed = r$marginals.fixed)
+fix_eff = fix_eff |> 
+  mutate(samples = purrr::map(m.fixed,~inla.smarginal(.x))) |>
+  mutate(x = purrr::map(samples,~.x[['x']]))
+
+df_fix = fix_eff |> dplyr::select(names,x) |> unnest(x)
+
+func_odds <- function(x){exp(x)/(1 + exp(x))}
+
+df_fix <- df_fix|> mutate(odds=sapply(x,func_odds))
+
+# Samples distribution random effects
+random_eff = tibble('names' = names(r$marginals.random),
+                    'm.random' = r$marginals.random)
+
+random_eff = random_eff |> 
+  mutate(index = purrr::map(m.random,~names(.x))) |> unnest(index)
+
+random_eff = random_eff |>
+  mutate(samples = purrr::map2(m.random,index,~inla.smarginal(.x[[.y]]))) |>
+  mutate(x = purrr::map(samples,~.x[['x']]))
+
+df_random = random_eff |> dplyr::select(names,index,x) |> unnest(x)
+
+func_odds <- function(x){exp(x)/(1 + exp(x))}
+
+df_random <- df_random |> mutate(odds=sapply(x,func_odds))
+return(list(df_fix,df_random))}
+
+# Plots random and fixed effects
+plot_dist_f_eff <- function(name,df){
+  plot <- df |> filter(names==name) |>  
+  ggplot(aes(x = x)) +
+  stat_slab(aes(
+    fill = after_stat(cut_cdf_qi(cdf,
+                                 .width = c(.5, .75, .95),
+                                 labels = percent_format(accuracy = 1)))),
+    position='dodge', point_interval = mean_qi)  +
+     stat_pointinterval(.width = c(.5, .75, .95),show.legend = c(size = F),point_size=3) +
+  scale_size_continuous(range = c(0.5, 10)) +
+  scale_fill_manual(values = c("#2c7fb8","#41b6c4","#a1dab4"),
+                    na.value = NA,
+                    na.translate = FALSE) +
+  labs(fill="Quantile",y="",x="",title=name) + geom_vline(xintercept=0,color="red") +
+    theme_bw(base_size = 14)+
+  theme(panel.background = element_blank(),
+        plot.title = element_text(size=9),
+        panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()) + 
+  scale_y_continuous(expand = c(0, 0))
+  
+  return(plot)}
+
+plot_dist_f_eff2 <- function(df){
+  plot <- df |>  
+  ggplot(aes(x = x,y=names)) +
+  stat_slab(aes(
+    fill = after_stat(cut_cdf_qi(cdf,
+                                 .width = c(.5, .75, .95),
+                                 labels = percent_format(accuracy = 1)))),
+    position='dodge', point_interval = mean_qi) +
+     stat_pointinterval(.width = c(.5, .75, .95),show.legend = c(size = F),point_size=3) +
+  scale_size_continuous(range = c(0.5, 10)) +
+   scale_fill_manual(values = c("#2c7fb8","#41b6c4","#a1dab4"),
+                     na.value = NA,
+                     na.translate = FALSE) +
+  labs(fill="Interval",y="",x="") + geom_vline(xintercept=0,color="red") +
+     theme_bw(base_size = 14)+
+  theme(panel.background = element_blank(),
+        plot.title = element_text(size=9),
+        panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(0, 0, 0, 0, "pt")) 
+  
+  return(plot)}
+
+plot_dist_r_eff <- function(name,df){
+  plot <- df |> filter(names==name) |>  
+  ggplot(aes(x = x,y=index)) +
+  stat_slab(aes(
+    fill = after_stat(cut_cdf_qi(cdf,
+                                 .width = c(.5, .75, .95),
+                                 labels = percent_format(accuracy = 1)))),
+    position='dodge', point_interval = mean_qi)  +
+     stat_pointinterval(.width = c(.5, .75, .95),show.legend = c(size = F),point_size=3) +
+  scale_size_continuous(range = c(1, 11)) +
+    scale_fill_manual(values = c("#2c7fb8","#41b6c4","#a1dab4"),
+                      na.value = NA,
+                      na.translate = FALSE) +
+  labs(fill="Interval",y="",x="",title="") + geom_vline(xintercept=0,color="red") +
+     theme_bw(base_size = 14)+
+  theme(panel.background = element_blank(),
+        plot.title = element_text(size=9),
+        panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(0, 0, 0, 0, "pt")) 
+  
+  return(plot)}
+```
+
+## INLA Functions
+
+```{r}
+# Define stack with inputs for INLA
+build_stack <- function(data_model){
+# Coordinates
+coo <- cbind(data_model$x, data_model$y) # Coordinates - meters UTM
+# Create the mesh
+RangeGuess <- 80000 # meters
+MaxEdge  <- RangeGuess/5
+ConvHull <- inla.nonconvex.hull(coo,convex=-0.08)		
+# convex factor changes the inner boundary to be closer to points
+# the non-convex hull approach: we might want to use a mesh which is based on a non-convex hull to avoid adding many small triangles outside the domain of interest (more triangles = larger computation times)
+mesh    <- inla.mesh.2d(loc = coo, #location coordinates that are used as initial mesh vertices
+                        boundary = ConvHull,
+                        max.edge = c(1, 5) * MaxEdge, #values denoting the maximum allowed triangle edge lengths in the region and in the extension outside
+                        cutoff  = MaxEdge / 5) #minimum allowed distance between points  
+# Define the weight factors or projector matrix
+
+plot(mesh)
+points(coo, col = "red")
+plot(gwb_p,add=T,border='darkgreen',color=NA,lwd=2)
+
+# Projection
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+# Create SPDE function (w matern covariance)
+spde <- inla.spde2.pcmatern(mesh = mesh,
+                          # alpha = 2,
+                          # constr=TRUE,
+                          prior.range = c(64373,0.01),
+                          prior.sigma =  c(0.01,0.001))
+
+
+
+# Index spatial field
+indexs <- inla.spde.make.index(name = "field",
+                               n.spde = spde$n.spde)
+
+print(lengths(indexs))
+
+stackfit <- inla.stack(
+  tag = "fit",
+  data = list(y = data_model$dry_condition),
+  A = list(1, A),
+  effects = list(data.frame(intercept = rep(1,nrow(data_model)),
+                            r_area_perennial = data_model$r_area_peren_sd,
+                            r_area_annual = data_model$r_area_annual_sd,
+                            r_area_forage = data_model$r_area_for_sd,
+                            r_well_depth_gw_level  = data_model$r_welldepth_gwdepth,
+                            surface_water  = data_model$sw_sd,
+                            ag_wells_density = data_model$ag_wells_density_sd,
+                            dom_wells_density = data_model$dom_wells_density_sd,
+                            Year_index = data_model$Year_index,
+                            basin_index = data_model$basin_index,
+                            poverty = data_model$Poverty_sd),
+                            field = indexs)
+)
+
+return(list(stackfit,spde,mesh))}
+```
+
+```{r}
+stack_validation <- function(data,mesh,field.spde){
+indexs <- inla.spde.make.index(name = "field",
+                               n.spde = field.spde$n.spde)
+LocPred <- cbind(data$x, data$y)
+A.pred <- inla.spde.make.A(mesh = mesh, loc = LocPred)
+N <- nrow(data)
+stack <- inla.stack(
+  tag = "validation",
+  data = list(y = data$dry_condition),  
+  A = list(1, A.pred),
+  effects = list(data.frame(intercept = rep(1,nrow(data)),
+                            r_area_perennial = data$r_area_peren_sd,
+                            r_area_annual = data$r_area_annual_sd,
+                            r_area_forage = data$r_area_for_sd,
+                            r_well_depth_gw_level  = data$r_welldepth_gwdepth,
+                            surface_water  = data$sw_sd,
+                            ag_wells_density = data$ag_wells_density_sd,
+                            dom_wells_density = data$dom_wells_density_sd,
+                            Year_index = data$Year_index,
+                            basin_index = data$basin_index,
+                            poverty = data$Poverty_sd),
+                            field = indexs)
+)
+
+return(stack)}
+```
+
+# INLA Model Calibration function
+```{r}
+INLA_model <- function(model,buffer){
+  
+if(buffer=="3mi"){
+  stack1 = stack_3mi[[1]]
+  spde1 = stack_3mi[[2]]
+}else if(buffer=="5mi"){
+  stack1 = stack_5mi[[1]]
+  spde1 = stack_5mi[[2]]
+}
+  
+formula <- tidy_models |> filter(buffer_size == buffer & names_model == model) |> pull(models)
+
+res <- INLA::inla(formula[[1]],
+  family = "binomial",
+  Ntrials = 1,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stack1,spde=spde1),
+  verbose=T,
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,config=TRUE,residuals=TRUE), 
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stack1)
+  )
+)
+
+return(list(res))}
+```
+
+# INLA Model Prediction function
+```{r}
+INLA_pred_model <- function(model,buffer){
+  
+if(buffer=="3mi"){
+  stack1 = stack_pred_3mi
+  spde1 = stack_3mi[[2]]
+}else if(buffer=="5mi"){
+  stack1 = stack_pred_5mi
+  spde1 = stack_5mi[[2]]
+}
+  
+formula <- tidy_models |> filter(buffer_size == buffer & names_model == model) |> pull(models)
+
+pred <- INLA::inla(formula[[1]],
+  family = "binomial",
+  Ntrials = 1,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stack1,spde=spde1),
+  control.compute = list(cpo = TRUE,config=TRUE,residuals=TRUE), 
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stack1)
+  )
+)
+
+return(list(pred))}
+```
+
+# Performance function
+```{r}
+performance_stats <- function(buffer,result){
+  
+if(buffer=="3mi"){
+data_model = data_3mi[[1]]
+}else if(buffer=="5mi"){
+data_model = data_5mi[[1]]
+}
+  
+index.fit <- inla.stack.index(stack_3mi[[1]], tag = "fit")$data
+DATA <- data.frame(
+  ID = c(1:nrow(data_model)),
+  observed = data_model$dry_condition,
+  predicted = result$summary.fitted.values[index.fit,"mean"])  
+
+AUC <- PresenceAbsence::auc(DATA, st.dev = TRUE, which.model = 1, na.rm = FALSE)
+DIC <- result$dic$dic
+WAIC <- result$waic$waic
+CPO.SCORE <- -sum(log(result$cpo$cpo))
+auc.roc.plot(DATA, threshold=101, which.model=1, model.names=c("Best model"),
+             na.rm=TRUE, xlab="1-Specificity (false positives)", ylab="Sensitivity (true positives)", main="ROC Plot", color=TRUE, line.type=TRUE, lwd=1, mark=0, mark.numbers=TRUE, opt.thresholds=TRUE)
+AUC.ROC.PLOT = recordPlot() 
+conf_matrix <- cmx(DATA, threshold = 0.5, which.model = 1, na.rm = FALSE)
+return(list(AUC,DIC,WAIC,CPO.SCORE,AUC.ROC.PLOT,as.data.frame(conf_matrix)))
+}
+```
+
+# Modeling for results shown in manuscript
+
+```{r}
+# Stacks for model calibration
+data_3mi <- split_data(data_model_3mi)
+data_5mi <- split_data(data_model_5mi)
+```
+
+# Let's do it tidy 
+
+```{r}
+m1 <- y ~ -1 + intercept + f(field, model = spde) + r_area_perennial +  r_area_annual +  r_area_forage
+
+m2 <- y ~ -1 + intercept + f(field, model = spde) + surface_water + ag_wells_density + dom_wells_density + r_well_depth_gw_level
+
+m3 <-  y ~ -1 + intercept + f(field, model = spde) + r_area_perennial +  r_area_annual +  r_area_forage +  r_well_depth_gw_level + surface_water + dom_wells_density  + ag_wells_density 
+
+m5 <-   y ~ -1 + intercept + f(field, model = spde) + r_area_perennial +  r_area_annual +  r_area_forage +   r_well_depth_gw_level + surface_water + dom_wells_density + ag_wells_density +  f(basin_index, model = "iid") + ag_wells_density:r_area_perennial + ag_wells_density:r_area_annual + ag_wells_density:r_area_forage 
+
+m6 <- y ~ -1 + intercept + f(field, model = spde) + r_area_perennial +  r_area_annual +  r_area_forage + r_well_depth_gw_level + surface_water + dom_wells_density + ag_wells_density +  f(basin_index, model = "iid") + ag_wells_density:r_area_perennial + ag_wells_density:r_area_annual + ag_wells_density:r_area_forage + poverty 
+
+m4 <- y ~ -1 + intercept + f(field, model = spde) + r_area_perennial +  r_area_annual +  r_area_forage +   surface_water + dom_wells_density + ag_wells_density +  f(basin_index, model = "iid") + ag_wells_density:r_area_perennial + ag_wells_density:r_area_annual + ag_wells_density:r_area_forage + poverty
+```
+
+```{r}
+list_models <- c(m1,m2,m3,m4,m5,m6)
+names_models <- c("m1","m2","m3","m4","m5","m6")
+```
+
+```{r}
+# Create tibble
+tidy_models <- tibble(buffer_size = c("3mi","5mi"))
+
+tidy_models <- tidy_models |> mutate(models = list(list_models)) |> unnest(models)
+
+tidy_models <- tidy_models |> mutate(names_model = rep(names_models,2))
+```
+
+```{r}
+# Stacks for model calibration
+stack_3mi <- build_stack(data_3mi[[1]])
+stack_5mi <- build_stack(data_5mi[[1]])
+```
+
+```{r}
+# Run models
+tidy_models <- tidy_models |> rowwise() |>
+  mutate(results = purrr::map2(names_model,buffer_size,~INLA_model(.x,.y),progress=T))
+```
+
+```{r}
+# Add statistics
+tidy_models <- tidy_models |> rowwise() |> 
+  mutate(stats = map2(buffer_size,results,~performance_stats(.x,.y))) |> ungroup()
+```
+
+# Performance Calibration
+```{r}
+results_models <- tidy_models |> dplyr::select(-results) |> 
+  mutate(AUC = map_dbl(stats,~.x[[1]][["AUC"]]),
+         AUC.SD = map_dbl(stats,~.x[[1]][["AUC.sd"]]),
+         DIC = map_dbl(stats,~.x[[2]]),
+         WAIC  = map_dbl(stats,~.x[[3]]),
+         CPO.SCORE = map_dbl(stats,~.x[[4]]),
+         AUC.ROC.PLOT = map(stats,~.x[[5]]),
+         CONF.M = map(stats,~.x[[6]]))
+  
+```
+
+# Visualize Results best model
+
+```{r}
+res_m <- tidy_models$results[tidy_models$buffer_size == "3mi" & tidy_models$names_model == "m6"][[1]][[1]]
+```
+
+```{r}
+# Summary Results
+res_m$summary.fixed
+```
+
+```{r}
+# Visualize
+results <- random_fix_effects(res_m)
+
+results[[2]]$index[results[[2]]$names=="basin_index" & results[[2]]$index == "index.1"] <- "MADERA"  
+
+results[[2]]$index[results[[2]]$names=="basin_index" & results[[2]]$index == "index.2"] <- "KINGS"  
+
+results[[2]]$index[results[[2]]$names=="basin_index" & results[[2]]$index == "index.3"] <- "KAWEAH" 
+
+results[[2]]$index[results[[2]]$names=="basin_index" & results[[2]]$index == "index.4"] <- "TULE" 
+# Plots
+fix_effects <- plot_dist_f_eff2(results[[1]]) 
+
+plist <- map(list(unique(results[[2]]$names)[2]),~plot_dist_r_eff(.x,results[[2]]))
+
+rand_effects <- patchwork::wrap_plots(plist,ncol=1,guides = "collect")+ labs(x="Log-Odds")
+```
+
+```{r}
+(fix_effects/plot_spacer()/rand_effects) + 
+  plot_layout(guides="collect",heights = c(16,-1.6,4))  & 
+  theme(legend.position = 'bottom')  & 
+  plot_annotation(tag_levels = 'A') &
+  theme(plot.tag = element_text(size = 12)) 
+```
+
+
+```{r}
+# Marginal Posterior Distribution Hyperparameters
+library(brinla)
+p_hyper <- bri.hyperpar.plot(res_m, together = FALSE) 
+ggplot() + geom_line(data=p_hyper,aes(x=x,y=y)) + facet_wrap(~parameter,scales="free") + labs(title="Marginal Posterior Distribution Hyperparameters",y="Density",x="")
+```
+
+# Spde results GMRF based on spde
+
+```{r}
+#looking at the spatial field and what it looks like
+mesh = stack_3mi[[3]]
+A1.grid <- inla.mesh.projector(mesh, dims = c(50, 50))
+inla.mesh.project(A1.grid, res_m$summary.random$field) %>%
+as.matrix() %>%
+as.data.frame() %>%
+bind_cols(
+expand.grid(x = A1.grid$x, y = A1.grid$y)
+) %>%
+filter(!is.na(ID)) -> eta_spde
+
+meanspde <- ggplot(st_as_sf(data_3mi[[1]],coords = c(lon='x',lat='y'),crs=3578)) +
+  geom_tile(data = eta_spde, aes(x = x, y = y, fill = mean)) +
+  scale_fill_viridis_c() +
+  geom_sf(alpha=0.2,color='orange') + 
+  geom_sf(data=gwb_p,alpha = 1, color="black", lwd=0.7,fill=NA) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      legend.key.size = unit(0.9, 'cm'),
+      legend.text=element_text(size=7)) +
+  labs(x="",y="")
+
+sdspde <-ggplot(st_as_sf(data_3mi[[1]],coords = c(lon='x',lat='y'),crs=3578)) +
+  geom_tile(data = eta_spde, aes(x = x, y = y, fill = sd)) +
+  scale_fill_viridis_c() +
+  geom_sf(alpha=0.2,color='orange') + 
+  geom_sf(data=gwb_p,alpha = 1, color="black", lwd=0.7,fill=NA) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      legend.key.size = unit(0.9, 'cm'),
+      legend.text=element_text(size=7)) +
+  labs(x="",y="")
+
+patchwork::wrap_plots(list(meanspde,sdspde),ncol=2)
+```
+
+# Residuals model
+
+```{r}
+## Extract residuals from binomial inla model
+Index <- inla.stack.index(stack_3mi[[1]], tag  = "fit")$data 
+RF1 <- data.frame(Residuals =  res_m$residuals$deviance.residuals, # Deviance residuals
+                  Predictions = res_m$summary.fitted.values[Index,"mean"],
+                  basin_index = data_3mi[[1]]$basin_index,
+                  x = data_3mi[[1]]$x,
+                  y = data_3mi[[1]]$y)
+
+RF1 <- RF1 |> filter(!is.na(Residuals))
+
+
+Loc <- RF1[, c("x", "y")] #Spatial locations
+Distances <- dist(Loc)
+
+point.color = viridis::viridis(100,option = "F")
+line.color = "gray10"
+fill.color = viridis::viridis(4,option = "F",alpha = 0.95)[2]
+
+#getting residuals
+residuals <- RF1$Residuals
+residuals.df <- as.data.frame(residuals)
+
+ #normality scores of the residuals
+residuals.qq <- qqnorm(residuals, plot.it=FALSE) %>%
+  as.data.frame()
+
+#qqplot
+p1 <- ggplot2::ggplot(data = residuals.qq) +
+  ggplot2::geom_point(
+    data = residuals.qq,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = y
+    )
+  ) +
+  ggplot2::scale_color_gradientn(colors = point.color) +
+  ggplot2::stat_qq_line(
+    ggplot2::aes(sample = residuals),
+    col = line.color,
+    linetype = "dashed"
+  ) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::ylab("Residuals") +
+  ggplot2::xlab("Theoretical")
+
+#histogram
+p2 <- ggplot2::ggplot(data = residuals.df) +
+  ggplot2::aes(
+    x = residuals
+    ) +
+  ggplot2::geom_histogram(
+    # binwidth = bw,
+    color = NA,
+    fill = fill.color
+  ) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::geom_vline(
+    xintercept = median(residuals),
+    col = line.color,
+    linetype = "dashed"
+  ) +
+  ggplot2::ylab("Count") +
+  ggplot2::xlab("Residuals")
+
+  #residuals vs predictions
+p3 <- ggplot2::ggplot(RF1) +
+    ggplot2::aes(
+      x = Predictions,
+      y = Residuals,
+      color = Residuals
+    ) +
+    ggplot2::geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      color = line.color
+    ) +
+    ggplot2::geom_point() +
+    ggplot2::scale_color_gradientn(colors = point.color) +
+    ggplot2::theme_bw() +
+    ggplot2::ggtitle("Residuals vs. predictions") +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5),
+      legend.position = "none"
+      )
+variogram_data <- RF1
+coordinates(variogram_data) <- ~x+y
+proj4string(variogram_data)= sf::st_crs(3578)[[2]]
+variogram_res <- gstat::variogram(Residuals~1, variogram_data, cressie = TRUE, cutoff = 100000)
+
+p5 <- ggplot() +
+  geom_point(data = variogram_res, aes(x = dist, y = gamma)) +
+  geom_smooth(data = variogram_res, aes(x = dist, y = gamma),col = "red") +
+  xlab("Distance m") + ylab("Semi-variance") +
+  theme_bw() +
+  theme(text = element_text(size = 11),
+        legend.position="none") +
+  ylim(0, 1) 
+
+#final plot
+residuals_plot <- ((p1 + p2) / p3) / (p5) + patchwork::plot_annotation(
+      theme = ggplot2::theme(plot.title = element_text(hjust = 0.5))
+  )
+```
+
+```{r}
+residuals_plot
+```
+
+```{r}
+# stop()
+```
+
+# Probability of dry well by variable plot
+
+```{r}
+#Function of Probability of occurrence curves for linear predictors 
+plot_prob_occurrence <- function(data,var,name_var){
+  
+X.p <- data.frame(
+  Intercept              = rep(1, nrow(data)),
+  variable = data |> pull({{var}}),
+  dry_condition = data$dry_condition)
+
+MyData <- data.frame(variable = seq(from = min(X.p$variable),
+                                            to = max(X.p$variable),
+                                            length = 100))
+
+Xmat <- model.matrix(~ variable,data = MyData)
+Xmat <- as.data.frame(Xmat)
+lcb <- inla.make.lincombs(Xmat)
+
+
+M.p <- inla(dry_condition ~ variable,lincomb = lcb,
+              control.predictor = list(link = 1,compute = TRUE),
+              family = "binomial",
+            Ntrials = 1,
+            data = X.p)
+
+Pred.pm <- M.p$summary.lincomb.derived[,c("mean","0.025quant", "0.975quant")]
+# print(head(M.p$summary.lincomb.derived), digits = 2)
+Pred.marg <- M.p$marginals.lincomb.derived
+# Pred.marg[[1]] 
+
+probability_f <- function(x) {exp(x) / (1 + exp(x))}
+
+inla.qmarginal(c(0.025, 0.5, 0.975), 
+               inla.tmarginal(probability_f , Pred.marg[[1]]))
+
+inla.emarginal(probability_f, Pred.marg[[1]])
+
+MyData$mu <- unlist(lapply(Pred.marg,function(x) inla.emarginal(probability_f, x)))
+MyData$selo <- unlist(lapply(Pred.marg,function(x)inla.qmarginal(c(0.025),inla.tmarginal(probability_f, x))))
+MyData$seup <- unlist(lapply(Pred.marg,function(x)inla.qmarginal(c(0.975),inla.tmarginal(probability_f, x))))
+
+p <- X.p |> ggplot() +
+  # geom_point(aes(y = dry_condition, x = variable),shape = 1,size = 1.5,alpha=0.15, colour="grey30") + 
+   geom_dots(aes(x= variable, y =dry_condition,side = ifelse(dry_condition, "bottom","top")), 
+            pch = 19, color = "grey35", scale = 0.2) +
+  xlab(name_var) + ylab("") +
+  theme_bw(base_size = 10) +
+  geom_line(data = MyData,aes(x = variable,y = mu),colour = "darkorange",linewidth = 1.0) +
+  geom_ribbon(data = MyData,aes(x = variable,ymax = seup,ymin = selo),alpha = 0.2) +
+  theme(panel.grid.major  = element_blank(),
+        panel.grid.minor  = element_blank())+scale_y_continuous(labels = label_percent())
+  
+
+return(p)
+}
+```
+
+```{r}
+forage_plot <- plot_prob_occurrence(data_model_3mi,r_area_forage,"Proportion Forage Crops")
+perennials_plot <- plot_prob_occurrence(data_model_3mi,r_area_perennial,"Proportion Perennial Crops")
+poverty_plot <- plot_prob_occurrence(data_model_3mi,Poverty,"Poverty")
+annuals_plot <- plot_prob_occurrence(data_model_3mi,r_area_annual,"Proportion Annual Crops")
+ratio_well_gw_plot <- plot_prob_occurrence(data_model_3mi,r_well_depth_gw_level,"Well depth/Groundwater level")
+sd_sw_plot <- plot_prob_occurrence(data_model_3mi,sw_sd,"Standirized Surface Water Supply")
+dom_wells_d_plot <- plot_prob_occurrence(data_model_3mi,dom_wells_density,"Domestic Wells Density")
+ag_wells_d_plot <-plot_prob_occurrence(data_model_3mi,ag_wells_density,"Agricultural Wells Density")
+```
+
+```{r}
+# Label
+glob_lab <- "Probability of Domestic Well Failure"
+p_lab <- 
+  ggplot() + 
+  annotate(geom = "text", x = 0.1, y = 0.1, label = glob_lab, angle = 90) +
+  coord_cartesian(clip = "on")+
+  theme_void()
+
+plots <- ((forage_plot + perennials_plot + annuals_plot) / (dom_wells_d_plot + ag_wells_d_plot + ratio_well_gw_plot) /(poverty_plot + sd_sw_plot)) & plot_annotation(tag_levels = 'A') &
+  theme(plot.tag = element_text(size = 10))
+
+(wrap_elements(p_lab) | wrap_elements(plots)) + plot_layout(widths = c(.1,5))
+```
+
+# Plot interaction effect
+```{r}
+interaction_plot <- function(cov_1,cov_2,name_1,name_2){
+data = data_model_3mi
+X.p <- data.frame(
+  Intercept              = rep(1, nrow(data)),
+  variable_1 = data |> dplyr::pull({{cov_1}}),
+  variable_2 = data |> dplyr::pull({{cov_2}}),
+  dry_condition = data$dry_condition)
+
+comb_space <- raster(xmn=min(X.p$variable_1),
+                     xmx=max(X.p$variable_1),
+                     ymn=min(X.p$variable_2),
+                     ymx=max(X.p$variable_2),
+                     nrows=50, ncols=50)
+
+MyData = as.data.frame(comb_space,xy=TRUE)
+colnames(MyData)[1] <- "variable_1"
+colnames(MyData)[2] <- "variable_2"
+
+Xmat <- model.matrix(~variable_1+variable_2,data = MyData)
+lcb <- inla.make.lincombs(as.data.frame(Xmat))
+
+
+M.p <- inla(dry_condition ~ variable_1 + variable_2,
+            lincomb = lcb,
+              control.predictor = list(link = 1,compute = TRUE),
+              family = "binomial",
+            Ntrials = 1,
+            data = X.p)
+
+Pred.pm <- M.p$summary.lincomb.derived[,c("mean","0.025quant", "0.975quant")]
+# print(head(M.p$summary.lincomb.derived), digits = 2)
+Pred.marg <- M.p$marginals.lincomb.derived
+# Pred.marg[[1]] 
+
+probability_f <- function(x) {exp(x) / (1 + exp(x))}
+
+inla.qmarginal(c(0.025, 0.5, 0.975), 
+               inla.tmarginal(probability_f , Pred.marg[[1]]))
+
+inla.emarginal(probability_f, Pred.marg[[1]])
+
+MyData$mu <- unlist(lapply(Pred.marg,function(x) inla.emarginal(probability_f, x)))
+
+
+p <- ggplot() +
+  geom_raster(data= MyData,aes(fill = mu, x = variable_1, y = variable_2)) + 
+labs(x=name_1,y=name_2,fill="Probability\nDry Well") +
+  theme_bw(base_size=14) + scale_fill_viridis_c(option = "F",direction=-1,limits = c(0, 1)) +
+  scale_y_continuous(expand=c(0,0)) +
+  scale_x_continuous(expand=c(0,0)) +
+  new_scale_fill() 
+
+p <- p +  geom_xsidedensity(data=X.p,aes(x=variable_1,y=stat(density)),color="darkorange2",size=1) +
+  geom_ysidedensity(data=X.p,aes(y=variable_2,x=stat(density)),color="darkorange2",size=1) + theme_bw(base_size=11) +
+  theme(ggside.axis.text.x=element_blank(),
+        ggside.axis.ticks.x=element_blank(),
+        ggside.axis.text.y=element_blank(),
+        ggside.axis.ticks.y=element_blank()) 
+
+return(p)
+}
+```
+
+```{r}
+perennial_ag_well_p <- interaction_plot(r_area_perennial,ag_wells_density,"Perennial crops Proportion","Agricultural Wells Density")
+annual_ag_well_p <- interaction_plot(r_area_annual,ag_wells_density,"Annual Crops Proportion","Agricultural Wells Density")
+forage_ag_well_p <- interaction_plot(r_area_forage,ag_wells_density,"Forage Crops Proportion","Agricultural Wells Density")
+
+perennial_ag_well_p + annual_ag_well_p + forage_ag_well_p + plot_layout(guides = 'collect')
+```
+
+
+# Validation of selected model: Prediction validation data set
+
+```{r}
+# Frist get the stack from INLA for prediction
+stack_pred_3mi <-  stack_validation(data_3mi[[2]],stack_3mi[[3]],stack_3mi[[2]])
+stack_pred_5mi <-  stack_validation(data_5mi[[2]],stack_5mi[[3]],stack_5mi[[2]])
+prediction_results <- INLA_pred_model ("m5","3mi")[[1]]
+```
+
+# Performance prediction for validation data set
+```{r}
+index.Pred <- inla.stack.index(stack_pred_5mi, tag = "validation")$data
+DATA_valid <- data.frame(
+  ID = c(1:nrow(data_3mi[[2]])),
+  observed = data_3mi[[2]]$dry_condition,
+  predicted = prediction_results$summary.fitted.values[index.Pred,"mean"])  
+
+AUC_valid <- PresenceAbsence::auc(DATA_valid, st.dev = TRUE, which.model = 1, na.rm = FALSE)
+CPO.SCORE <- -sum(log(prediction_results$cpo$cpo))
+print(CPO.SCORE)
+auc.roc.plot(DATA_valid, threshold=101, which.model=1, model.names=c("Best model"),
+             na.rm=TRUE, xlab="1-Specificity (false positives)", ylab="Sensitivity (true positives)", main="ROC Plot - Validation Set", color=TRUE, line.type=TRUE, lwd=1, mark=0, mark.numbers=TRUE, opt.thresholds=TRUE)
+AUC.ROC.PLOT_valid = recordPlot() 
+conf_matrix_valid <- cmx(DATA_valid, threshold = 0.5, which.model = 1, na.rm = FALSE)
+```
+
+# Map prediction validation set
+
+```{r}
+library(ggspatial)
+# Visualize where we were or not able to predict dry wells from the validation set
+DATA_valid$x <- data_3mi[[2]]$x
+DATA_valid$y <- data_3mi[[2]]$y
+
+DATA_valid <- DATA_valid |> 
+  mutate(Predicted = case_when(observed == 0 & predicted < 0.5 ~ "TRUE",
+                               observed == 1 & predicted >= 0.5 ~ "TRUE",
+                               .default = "FALSE"))
+
+DATA_valid <- DATA_valid |> st_as_sf(coords=c("x","y"), crs = 3578) 
+
+ggplot() + 
+  geom_sf(data=gwb_p,color="black",fill=NA) +
+  geom_sf(data=DATA_valid,aes(color=Predicted,shape=as.factor(observed)),
+          size=2,
+          alpha=0.6) +
+  scale_color_manual(values=c("gray40","orange")) +
+  labs(shape = "Dry Condition",
+       color = "Predicted Corrrectly")+
+  theme_bw(base_size = 14) +
+  theme(axis.text.x=element_blank(),
+      axis.ticks.x=element_blank(),
+      axis.text.y=element_blank(),
+      axis.ticks.y=element_blank(),
+      legend.position=c(0.3,0.2),
+      legend.background = element_rect(fill='transparent'),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank())+
+   annotation_north_arrow(
+    location = "tl",
+    pad_x = unit(4, "in"),
+    pad_y = unit(0.1, "in"),
+    style = north_arrow_fancy_orienteering
+  )
+```
+
+# Test model without SPDE (test autocorrelation)
+
+```{r}
+logit_m6 <- glmer(dry_condition ~  r_area_peren_sd +  r_area_annual_sd +  r_area_for_sd + r_welldepth_gwdepth + sw_sd + dom_wells_density_sd +  r_area_peren_sd:ag_wells_density_sd +  r_area_annual_sd:ag_wells_density_sd +  r_area_for_sd:ag_wells_density_sd + Poverty_sd + (1|basin_index)+ ag_wells_density_sd, data = data_3mi[[1]], family = "binomial")
+
+```
+
+```{r}
+summary(logit_m6)
+```
+
+```{r}
+## Extract residuals from binomial inla model
+RF2 <- data.frame(Residuals =  residuals(logit_m6, type = "deviance"), # Deviance residuals
+                  Predictions = fitted(logit_m6),
+                  x = data_3mi[[1]]$x,
+                  y = data_3mi[[1]]$y)
+
+RF2 <- RF2 |> filter(!is.na(Residuals))
+
+
+Loc <- RF2[, c("x", "y")] #Spatial locations
+Distances <- dist(Loc)
+
+point.color = viridis::viridis(100,option = "F")
+line.color = "gray10"
+fill.color = viridis::viridis(4,option = "F",alpha = 0.95)[2]
+
+#getting residuals
+residuals <- RF2$Residuals
+residuals.df <- as.data.frame(residuals)
+
+ #normality scores of the residuals
+residuals.qq <- qqnorm(residuals, plot.it=FALSE) %>%
+  as.data.frame()
+
+#qqplot
+p1 <- ggplot2::ggplot(data = residuals.qq) +
+  ggplot2::geom_point(
+    data = residuals.qq,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = y
+    )
+  ) +
+  ggplot2::scale_color_gradientn(colors = point.color) +
+  ggplot2::stat_qq_line(
+    ggplot2::aes(sample = residuals),
+    col = line.color,
+    linetype = "dashed"
+  ) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::ylab("Residuals") +
+  ggplot2::xlab("Theoretical")
+
+#histogram
+p2 <- ggplot2::ggplot(data = residuals.df) +
+  ggplot2::aes(
+    x = residuals
+    ) +
+  ggplot2::geom_histogram(
+    # binwidth = bw,
+    color = NA,
+    fill = fill.color
+  ) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::geom_vline(
+    xintercept = median(residuals),
+    col = line.color,
+    linetype = "dashed"
+  ) +
+  ggplot2::ylab("Count") +
+  ggplot2::xlab("Residuals")
+
+  #residuals vs predictions
+p3 <- ggplot2::ggplot(RF2) +
+    ggplot2::aes(
+      x = Predictions,
+      y = Residuals,
+      color = Residuals
+    ) +
+    ggplot2::geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      color = line.color
+    ) +
+    ggplot2::geom_point() +
+    ggplot2::scale_color_gradientn(colors = point.color) +
+    ggplot2::theme_bw() +
+    ggplot2::ggtitle("Residuals vs. predictions") +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5),
+      legend.position = "none"
+      )
+
+variogram_data <- RF2
+coordinates(variogram_data) <- ~x+y
+proj4string(variogram_data)= sf::st_crs(3578)[[2]]
+variogram_res <- gstat::variogram(Residuals~1, variogram_data, cressie = TRUE, cutoff = 100000)
+
+p5 <- ggplot() +
+  geom_point(data = variogram_res, aes(x = dist, y = gamma)) +
+  geom_smooth(data = variogram_res, aes(x = dist, y = gamma),col = "red") +
+  xlab("Distance m") + ylab("Semi-variance") +
+  theme_bw() +
+  theme(text = element_text(size = 11),
+        legend.position="none") +
+  ylim(0, 1) 
+
+#final plot
+residuals_plot <- ((p1 + p2) / p3) / (p5) + patchwork::plot_annotation(
+      theme = ggplot2::theme(plot.title = element_text(hjust = 0.5))
+  )
+```
+
+```{r}
+residuals_plot
+```
+
+```{r}
+fit.variogram(variogram_res, vgm("Sph"))
+```
+
+```{r}
+library(PsychHelperFunctions)
+# Asses for OD
+PsychHelperFunctions::overdisp_fun(logit_m6)
+```
+
+
